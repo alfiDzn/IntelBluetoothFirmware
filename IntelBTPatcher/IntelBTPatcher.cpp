@@ -8,6 +8,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
+#include <kern/thread_call.h>
 
 #include "IntelBTPatcher.hpp"
 
@@ -67,11 +68,27 @@ static KernelPatcher::KextInfo IntelBTPatcher_IOUsbHostInfo {
 };
 
 bool CIntelBTPatcher::_randomAddressInit = false;
+void * volatile CIntelBTPatcher::_eventPipe = nullptr;
+void * volatile CIntelBTPatcher::_eventPipeDevice = nullptr;
+bool CIntelBTPatcher::_dlePatchEnabled = false;
+bool CIntelBTPatcher::_dleLookupEnabled = false;
+
+static thread_call_t eventPipeLookupCall = nullptr;
+static void eventPipeLookup(thread_call_param_t, thread_call_param_t device);
 
 bool CIntelBTPatcher::init()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
+    // Opt-in, in two steps so each can be tested on its own:
+    //   -ibtdleio  only route IOUSBHostPipe::io (every read passes straight through)
+    //   -ibtdle    route it and find the Intel event pipe, so the LE features reply gets patched
+    // Without either, this kext routes exactly what upstream 2.5.0 routes.
+    _dleLookupEnabled = checkKernelArgument("-ibtdle");
+    _dlePatchEnabled = _dleLookupEnabled || checkKernelArgument("-ibtdleio");
+    if (_dleLookupEnabled)
+        eventPipeLookupCall = thread_call_allocate(eventPipeLookup, nullptr);
+    SYSLOG(DRV_NAME, "LE Data Length Extension hiding: io %d lookup %d", _dlePatchEnabled, _dleLookupEnabled);
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&IntelBTPatcher_IOBluetoothInfo, 1,
         [](void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -128,6 +145,22 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError());
                 patcher.clearError();
             }
+
+            if (!_dlePatchEnabled)
+                return;
+
+            KernelPatcher::RouteRequest asyncIORequest {
+                "__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
+                newAsyncIO,
+                oldAsyncIO
+            };
+            patcher.routeMultiple(index, &asyncIORequest, 1, address, size);
+            if (patcher.getError() == KernelPatcher::Error::NoError) {
+                SYSLOG(DRV_NAME, "routed %s", asyncIORequest.symbol);
+            } else {
+                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", asyncIORequest.symbol, patcher.getError());
+                patcher.clearError();
+            }
         }
     }
 }
@@ -158,12 +191,91 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 #define HCI_OP_LE_SET_SCAN_PARAM    0x200B
 #define HCI_OP_LE_SET_SCAN_ENABLE   0x200C
 
+#define VENDOR_USB_INTEL            0x8087
+#define HCI_EVENT_PIPE_ADDRESS      0x81
+
+// Lilu RELEASE builds drop SYSLOG, so progress is published as properties on the plugin's
+// IOService instead: ioreg -l -w0 -c IntelBTPatcher | grep DLE
+static void reportDLE(const char *key, uint32_t value)
+{
+    if (ADDPR(selfInstance))
+        ADDPR(selfInstance)->setProperty(key, value, 32);
+}
+
+// Last non-Intel device seen sending class requests, so it is not queued for lookup again.
+static void * volatile lastOtherDevice = nullptr;
+
+// Look up the interrupt IN pipe of the Intel device that is sending HCI commands. Runs on a
+// thread call, never inside deviceRequest, so it cannot touch a device that is still being
+// enumerated or contend for USB gates held by the request path. Redone when the device object
+// changes (re-enumeration after firmware load).
+static void findEventPipe(IOUSBHostDevice *device)
+{
+    if (device == CIntelBTPatcher::_eventPipeDevice || device == lastOtherDevice)
+        return;
+    const StandardUSB::DeviceDescriptor *deviceDescriptor = device->getDeviceDescriptor();
+    if (!deviceDescriptor || deviceDescriptor->idVendor != VENDOR_USB_INTEL) {
+        lastOtherDevice = device;
+        return;
+    }
+    CIntelBTPatcher::_eventPipeDevice = device;
+    static uint32_t lookups = 0;
+    reportDLE("DLEIoHooked", callbackIBTPatcher->oldAsyncIO ? 1 : 0);
+    reportDLE("DLEPipeLookups", ++lookups);
+
+    OSIterator *iterator = device->getChildIterator(gIOServicePlane);
+    if (!iterator)
+        return;
+    while (OSObject *child = iterator->getNextObject()) {
+        IOUSBHostInterface *interface = OSDynamicCast(IOUSBHostInterface, child);
+        if (!interface)
+            continue;
+        IOUSBHostPipe *pipe = interface->copyPipe(HCI_EVENT_PIPE_ADDRESS);
+        if (pipe) {
+            // Only the address is kept, for comparison in newAsyncIO.
+            CIntelBTPatcher::_eventPipe = pipe;
+            pipe->release();
+            static uint32_t found = 0;
+            reportDLE("DLEPipeFound", ++found);
+            SYSLOG(DRV_NAME, "[DLE] found HCI event pipe via device lookup");
+            break;
+        }
+    }
+    iterator->release();
+}
+
+static void eventPipeLookup(thread_call_param_t, thread_call_param_t device)
+{
+    findEventPipe((IOUSBHostDevice *)device);
+    ((IOUSBHostDevice *)device)->release();
+}
+
+#define USB_REQUEST_TYPE_MASK       0x60
+#define USB_REQUEST_TYPE_CLASS      0x20
+
+// Called from deviceRequest: only queues work, and only for class requests (HCI commands go out
+// as class requests; enumeration uses standard ones).
+static void queueEventPipeLookup(IOUSBHostDevice *device, const StandardUSB::DeviceRequest &request)
+{
+    if ((request.bmRequestType & USB_REQUEST_TYPE_MASK) != USB_REQUEST_TYPE_CLASS)
+        return;
+    if (device == CIntelBTPatcher::_eventPipeDevice || device == lastOtherDevice || !eventPipeLookupCall)
+        return;
+    device->retain();
+    // Returns true if a lookup was already pending; that one keeps its own reference.
+    if (thread_call_enter1(eventPipeLookupCall, device))
+        device->release();
+}
+
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
 {
     HciCommandHdr *hdr = nullptr;
     uint32_t hdrLen = 0;
     char hciBuf[MAX_HCI_BUF_LEN] = {0};
-    
+
+    if (_dleLookupEnabled && callbackIBTPatcher->oldAsyncIO && that)
+        queueEventPipeLookup((IOUSBHostDevice *)that, request);
+
     if (data == nullptr) {
         if (descriptor != nullptr &&
             (getKernelVersion() < KernelVersion::Sequoia || !descriptor->prepare(kIODirectionOut))) {
@@ -217,4 +329,81 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
 #endif
     }
     return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
+}
+
+#pragma mark - Hide LE Data Length Extension from bluetoothd
+
+// bluetoothd sends LE Set Data Length to every peer that supports DLE and then waits for an
+// LE Data Length Change event before it calls the link ready. Intel firmware only sends that
+// event when the lengths actually change, so a peer that keeps the default 27 bytes (e.g. some
+// BLE mice) never becomes ready: no GATT, no pairing, disconnect after ~30 s. Clearing the
+// DLE bit in the controller's LE feature mask makes bluetoothd skip that step for every link.
+
+#define HCI_EV_CMD_COMPLETE             0x0E
+#define HCI_OP_LE_READ_LOCAL_FEATURES   0x2003
+#define LE_FEATURE_DATA_LENGTH_EXT      0x20    // LE feature bit 5, in the first feature byte
+
+// Command Complete: evt, plen, ncmd, opcode lo, opcode hi, status, features[8]
+#define LE_FEATURES_EVT_LEN             14
+#define LE_FEATURES_BYTE0_OFFSET        6
+
+static void hideDataLengthExtension(IOMemoryDescriptor *dataBuffer, uint32_t bytesTransferred)
+{
+    if (!dataBuffer || bytesTransferred < LE_FEATURES_EVT_LEN)
+        return;
+    if (dataBuffer->prepare() != kIOReturnSuccess)
+        return;
+    uint8_t evt[LE_FEATURES_BYTE0_OFFSET + 1];
+    if (dataBuffer->readBytes(0, evt, sizeof(evt)) == sizeof(evt) &&
+        evt[0] == HCI_EV_CMD_COMPLETE &&
+        evt[1] >= LE_FEATURES_EVT_LEN - 2 &&
+        evt[3] == (HCI_OP_LE_READ_LOCAL_FEATURES & 0xFF) &&
+        evt[4] == (HCI_OP_LE_READ_LOCAL_FEATURES >> 8) &&
+        evt[5] == 0x00 &&
+        (evt[LE_FEATURES_BYTE0_OFFSET] & LE_FEATURE_DATA_LENGTH_EXT)) {
+        uint8_t patched = evt[LE_FEATURES_BYTE0_OFFSET] & ~LE_FEATURE_DATA_LENGTH_EXT;
+        dataBuffer->writeBytes(LE_FEATURES_BYTE0_OFFSET, &patched, 1);
+        static uint32_t patchedCount = 0;
+        reportDLE("DLEFeaturesPatched", ++patchedCount);
+        SYSLOG(DRV_NAME, "[DLE] LE features byte0 0x%02x -> 0x%02x", evt[LE_FEATURES_BYTE0_OFFSET], patched);
+    }
+    dataBuffer->complete();
+}
+
+static void eventReadCompletion(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred)
+{
+    EventReadContext *context = (EventReadContext *)owner;
+    IOUSBHostCompletion orig = context->orig;
+    if (status == kIOReturnSuccess)
+        hideDataLengthExtension(context->dataBuffer, bytesTransferred);
+    IOFree(context, sizeof(EventReadContext));
+    if (orig.action)
+        orig.action(orig.owner, parameter, status, bytesTransferred);
+}
+
+IOReturn CIntelBTPatcher::newAsyncIO(void *that, IOMemoryDescriptor *dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion *completion, uint32_t completionTimeoutMs)
+{
+    if (that && that == _eventPipe && completion) {
+        EventReadContext *context = (EventReadContext *)IOMalloc(sizeof(EventReadContext));
+        if (context) {
+            context->orig = *completion;
+            context->dataBuffer = dataBuffer;
+            context->hook.owner = context;
+            context->hook.action = eventReadCompletion;
+            context->hook.parameter = completion->parameter;
+            // The completion is copied by io() and only called when io() succeeds.
+            IOReturn ret = FunctionCast(newAsyncIO, callbackIBTPatcher->oldAsyncIO)(that, dataBuffer, dataBufferLength, &context->hook, completionTimeoutMs);
+            if (ret != kIOReturnSuccess) {
+                IOFree(context, sizeof(EventReadContext));
+            } else {
+                static bool reported = false;
+                if (!reported) {
+                    reported = true;
+                    reportDLE("DLEReadsWrapped", 1);
+                }
+            }
+            return ret;
+        }
+    }
+    return FunctionCast(newAsyncIO, callbackIBTPatcher->oldAsyncIO)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
 }

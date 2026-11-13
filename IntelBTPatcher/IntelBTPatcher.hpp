@@ -11,16 +11,18 @@
 #include <Headers/kern_patcher.hpp>
 
 #include <IOKit/usb/IOUSBHostDevice.h>
+#include <IOKit/usb/IOUSBHostInterface.h>
 
 #define DRV_NAME "ibtp"
 
 class BluetoothDeviceAddress;
 
+// One per queued read on the HCI event pipe; the caller's completion is kept in orig.
 typedef struct {
-    void *owner;
+    IOUSBHostCompletion orig;
+    IOUSBHostCompletion hook;
     IOMemoryDescriptor *dataBuffer;
-    IOUSBHostCompletionAction action;
-} AsyncOwnerData;
+} EventReadContext;
 
 typedef struct __attribute__((packed))
 {
@@ -83,10 +85,17 @@ public:
     
     static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length,IOUSBHostCompletion *completion, unsigned int timeout);
 
-    
+    static IOReturn newAsyncIO(void *that, IOMemoryDescriptor *dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion *completion, uint32_t completionTimeoutMs);
+
     mach_vm_address_t oldFindQueueRequest {};
     mach_vm_address_t oldHostDeviceRequest {};
-    
+    mach_vm_address_t oldAsyncIO {};
+
+    static void * volatile _eventPipe;
+    static void * volatile _eventPipeDevice;
+    static bool _dlePatchEnabled;   // route IOUSBHostPipe::io
+    static bool _dleLookupEnabled;  // also find the event pipe, so reads actually get patched
+
 private:
     static bool _randomAddressInit;
 };
